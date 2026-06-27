@@ -15,7 +15,7 @@ try:
     from rich.text import Text
     from rich import box
 except ImportError:
-    print("Instalá rich: sudo pacman -S python-rich")
+    print("Install rich: sudo pacman -S python-rich")
     sys.exit(1)
 
 # Forzar color aunque sudo/TERM no lo detecte bien
@@ -45,12 +45,13 @@ def discover_columns() -> list:
     try:
         res = subprocess.run(["turbostat", "-n", "1", "--quiet"], capture_output=True, text=True)
         lines = res.stdout.strip().splitlines()
-        if lines:
-            header = lines[0].split()
-            if header and "CPU" in header:
-                header.remove("CPU")
-            header.insert(0, "CPU")
-            return header
+        for line in lines:
+            if line.startswith("CPU"):
+                header = line.split()
+                if "CPU" in header:
+                    header.remove("CPU")
+                header.insert(0, "CPU")
+                return header
     except Exception:
         pass
     # Fallback default
@@ -58,7 +59,7 @@ def discover_columns() -> list:
 
 def check_turbostat():
     if not shutil.which("turbostat"):
-        console.print("[bold red]✗ turbostat no encontrado.[/]")
+        console.print("[bold red]✗ turbostat not found.[/]")
         sys.exit(1)
 
 def fv(d: dict, key: str, default=0.0) -> float:
@@ -268,18 +269,18 @@ def build_ui(summary, cpu_rows, interval):
         (ts, C_DIM), (f"  interval={interval}s", C_DIM),
         ("   [M] Menu   [Q] Quit", C_VALUE)
     )
-    top = make_summary_panel(summary) if summary else Panel("[dim]Esperando…[/dim]", border_style=C_BORDER)
+    top = make_summary_panel(summary) if summary else Panel("[dim]Waiting...[/dim]", border_style=C_BORDER)
 
     if show_menu:
         bot = Align.center(make_menu_panel())
     else:
         bot = Panel(
-            make_cpu_table(cpu_rows) if cpu_rows else Text("Sin datos por CPU aún", style=C_DIM),
+            make_cpu_table(cpu_rows) if cpu_rows else Text("No per-CPU data available yet", style=C_DIM),
             title=f"[{C_HEADER}] PER-CPU [/{C_HEADER}]",
             border_style=C_BORDER, padding=(0,1),
         )
 
-    hint = Text("  Ctrl+C para salir", style=C_DIM, justify="right")
+    hint = Text("  Ctrl+C to exit", style=C_DIM, justify="right")
     return Group(title, top, bot, hint)
 
 def spawn_turbostat(interval):
@@ -302,7 +303,12 @@ def run_turbostat(proc):
             line = None
 
         if line is None or line == "":
-            yield None
+            if block:
+                yield "\n".join(block)
+                block = []
+            else:
+                yield None
+
             if proc.poll() is not None:
                 # One last attempt to drain
                 try:
@@ -409,13 +415,19 @@ def main():
                             current_summary, current_cpu_rows = new_summary, new_cpu_rows
                             busy_history.append(fv(current_summary, "Busy%"))
                 except StopIteration:
+                    if proc.poll() is not None:
+                        if needs_restart is False:
+                            proc = spawn_turbostat(args.interval)
+                            stream = run_turbostat(proc)
+                        else:
+                            break
                     pass
 
                 live.update(build_ui(current_summary, current_cpu_rows, args.interval))
                 time.sleep(0.05)
 
     except KeyboardInterrupt:
-        console.print(f"\n[{C_LABEL}]Hasta luego.[/{C_LABEL}]")
+        console.print(f"\n[{C_LABEL}]Goodbye.[/{C_LABEL}]")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         if proc.poll() is None:
