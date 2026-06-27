@@ -390,32 +390,22 @@ def main():
             while True:
                 ui_needs_update = False
                 # Handle Non-Blocking Keyboard Input
-                while True:
-                    dr, dw, de = select.select([sys.stdin], [], [], 0.0)
-                    if not dr:
-                        break
+                dr, dw, de = select.select([sys.stdin], [], [], 0.0)
+                if dr:
                     try:
-                        ch_bytes = os.read(sys.stdin.fileno(), 1)
+                        ch = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
                     except BlockingIOError:
-                        break
-                    if not ch_bytes:
-                        break
-                    ch = ch_bytes.decode('utf-8', errors='ignore')
-                    if ch in ('q', 'Q'):
-                        return
-                    elif ch in ('m', 'M'):
-                        show_menu = not show_menu
-                        ui_needs_update = True
-                    elif ch == '\x1b':
+                        ch = ''
+                    if ch == '\x1b':
                         # Handle escape sequence or plain Esc
-                        dr2, dw2, de2 = select.select([sys.stdin], [], [], 0.0)
+                        dr2, dw2, de2 = select.select([sys.stdin], [], [], 0.01)
                         if dr2:
                             try:
                                 seq = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
                             except BlockingIOError:
                                 seq = ''
                             if seq == '[':
-                                dr3, dw3, de3 = select.select([sys.stdin], [], [], 0.0)
+                                dr3, dw3, de3 = select.select([sys.stdin], [], [], 0.01)
                                 if dr3:
                                     try:
                                         key = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
@@ -440,13 +430,21 @@ def main():
                         else:
                             show_menu = False
                             ui_needs_update = True
-                    elif ch in (' ', '\n', '\r'):
-                        if show_menu and menu_cursor > 0:
-                            col = TURBOSTAT_COLS[menu_cursor - 1]
-                            if col != "CPU":
-                                column_state[col] = not column_state[col]
-                                needs_restart = True
-                                ui_needs_update = True
+                        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                    else:
+                        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                        if ch in ('q', 'Q'):
+                            return
+                        elif ch in ('m', 'M'):
+                            show_menu = not show_menu
+                            ui_needs_update = True
+                        elif ch in (' ', '\n', '\r'):
+                            if show_menu and menu_cursor > 0:
+                                col = TURBOSTAT_COLS[menu_cursor - 1]
+                                if col != "CPU":
+                                    column_state[col] = not column_state[col]
+                                    needs_restart = True
+                                    ui_needs_update = True
 
                 if needs_restart:
                     proc.terminate()
