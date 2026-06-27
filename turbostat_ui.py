@@ -4,7 +4,7 @@ turbostat_ui.py — Live CPU metrics dashboard usando turbostat + Rich TUI
 Uso: sudo python turbostat_ui.py [--interval N]
 """
 
-import subprocess, sys, time, argparse, shutil
+import subprocess, sys, time, argparse, shutil, select, termios, tty, os
 from typing import Optional
 
 try:
@@ -38,6 +38,13 @@ TURBOSTAT_COLS = [
     "CoreTmp","CoreThr","PkgTmp","GFX%rc6","GFXMHz",
     "PkgWatt","GFXWatt","SysWatt"
 ]
+
+import collections
+busy_history = collections.deque(maxlen=30)
+
+show_menu = False
+menu_cursor = 0
+column_state = {col: True for col in TURBOSTAT_COLS}
 
 def check_turbostat():
     if not shutil.which("turbostat"):
@@ -74,6 +81,21 @@ def parse_block(raw: str):
             summary = row
         else:
             cpus.append(row)
+
+    # HT Grouping (Feature 3): Group by identical non-zero CoreTmp
+    tmp_groups = {}
+    next_grp_id = 0
+    for r in cpus:
+        tmp_val = fv(r, "CoreTmp")
+        if tmp_val > 0:
+            if tmp_val not in tmp_groups:
+                tmp_groups[tmp_val] = next_grp_id
+                next_grp_id += 1
+            r["_GRP"] = tmp_groups[tmp_val]
+        else:
+            r["_GRP"] = -1
+
+    cpus.sort(key=lambda r: int(r.get("CPU", 0) or 0))
     return summary, cpus
 
 def temp_color(t: float) -> str:
@@ -106,11 +128,23 @@ def make_summary_panel(s: dict) -> Panel:
     c1       = fv(s,"CPU%c1")
     c7       = fv(s,"CPU%c7")
 
+    blocks = "▁▂▃▄▅▆▇█"
+    max_b = max(busy_history) if busy_history else 0
+    spark_chars = []
+    for val in busy_history:
+        idx = int((val / max_b) * 7) if max_b > 0 else 0
+        spark_chars.append(blocks[idx])
+    sparkline = "".join(spark_chars)
+
     rows = [
         Text.assemble(
             ("  BUSY  ", C_LABEL), (f"{busy:5.1f}%  ", busy_color(busy)),
             bar(busy, 100),
             ("   FREQ  ", C_LABEL), (f"{bzy_mhz:>6.0f} MHz", C_VALUE),
+        ),
+        Text.assemble(
+            ("  HIST  ", C_LABEL), (f"{sparkline:<30} ", C_VALUE),
+            ("PEAK ", C_LABEL), (f"{max_b:5.1f}%", C_HOT),
         ),
         Text.assemble(
             ("  PKG   ", C_LABEL), (f"{pkg_tmp:5.0f} °C  ", temp_color(pkg_tmp)),
@@ -143,6 +177,28 @@ def make_summary_panel(s: dict) -> Panel:
         padding=(0, 1),
     )
 
+def make_menu_panel() -> Panel:
+    from rich.console import Group
+    rows = []
+    for i, col in enumerate(TURBOSTAT_COLS):
+        is_active = column_state.get(col, False)
+        indicator = "●" if is_active else "○"
+
+        style = C_VALUE if i == menu_cursor else C_DIM
+        if col == "CPU":
+            style = C_HOT if i == menu_cursor else C_LABEL
+
+        prefix = "> " if i == menu_cursor else "  "
+        rows.append(Text(f"{prefix}{indicator} {col}", style=style))
+
+    return Panel(
+        Group(*rows),
+        title=f"[{C_HEADER}] ⚙ MENU [/{C_HEADER}]",
+        border_style=C_BORDER,
+        padding=(1, 4),
+        expand=False
+    )
+
 def make_cpu_table(cpu_rows: list) -> Table:
     tbl = Table(
         box=box.SIMPLE_HEAD,
@@ -152,6 +208,7 @@ def make_cpu_table(cpu_rows: list) -> Table:
         pad_edge=False,
         expand=True,
     )
+    tbl.add_column("GRP",    width=3,  justify="center")
     tbl.add_column("CPU",    style=C_LABEL, width=4,  justify="right")
     tbl.add_column("MHz",    style=C_VALUE, width=6,  justify="right")
     tbl.add_column("Busy %", width=22)
@@ -160,13 +217,28 @@ def make_cpu_table(cpu_rows: list) -> Table:
     tbl.add_column("C7 %",   style=C_IDLE, width=7,  justify="right")
     tbl.add_column("Thr",    style=C_WARM, width=4,  justify="center")
 
+    max_busy = max((fv(r, "Busy%") for r in cpu_rows), default=0)
+
     for r in cpu_rows:
         busy = fv(r,"Busy%"); mhz = fv(r,"Bzy_MHz")
         ctmp = fv(r,"CoreTmp"); c1 = fv(r,"CPU%c1"); c7 = fv(r,"CPU%c7")
         thr  = r.get("CoreThr") or "0"
 
-        busy_cell = Text.assemble(bar(busy, 100, 14), " ", (f"{busy:5.1f}%", busy_color(busy)))
+        grp_id = r.get("_GRP", -1)
+        if grp_id == -1:
+            grp_cell = Text(" ", style=C_DIM)
+        else:
+            grp_style = C_VALUE if grp_id % 2 == 0 else C_DIM
+            grp_cell = Text("║", style=grp_style)
+
+        busy_parts = [bar(busy, 100, 14), " ", (f"{busy:5.1f}%", busy_color(busy))]
+        if busy > 0 and busy == max_busy:
+            busy_parts.append((" ◀", C_HOT))
+
+        busy_cell = Text.assemble(*busy_parts)
+
         tbl.add_row(
+            grp_cell,
             r.get("CPU","?"),
             f"{mhz:.0f}",
             busy_cell,
@@ -179,24 +251,37 @@ def make_cpu_table(cpu_rows: list) -> Table:
 
 def build_ui(summary, cpu_rows, interval):
     from rich.console import Group
+    from rich.align import Align
     ts = time.strftime("%H:%M:%S")
     title = Text.assemble(
         ("╸ TURBOSTAT MONITOR   ", C_HEADER),
         (ts, C_DIM), (f"  interval={interval}s", C_DIM),
+        ("   [M] Menu   [Q] Quit", C_VALUE)
     )
     top = make_summary_panel(summary) if summary else Panel("[dim]Esperando…[/dim]", border_style=C_BORDER)
-    bot = Panel(
-        make_cpu_table(cpu_rows) if cpu_rows else Text("Sin datos por CPU aún", style=C_DIM),
-        title=f"[{C_HEADER}] PER-CPU [/{C_HEADER}]",
-        border_style=C_BORDER, padding=(0,1),
-    )
+
+    if show_menu:
+        bot = Align.center(make_menu_panel())
+    else:
+        bot = Panel(
+            make_cpu_table(cpu_rows) if cpu_rows else Text("Sin datos por CPU aún", style=C_DIM),
+            title=f"[{C_HEADER}] PER-CPU [/{C_HEADER}]",
+            border_style=C_BORDER, padding=(0,1),
+        )
+
     hint = Text("  Ctrl+C para salir", style=C_DIM, justify="right")
     return Group(title, top, bot, hint)
 
-def run_turbostat(interval):
+def spawn_turbostat(interval):
+    active_cols = [col for col in TURBOSTAT_COLS if column_state.get(col, True)]
+    # Ensure CPU is always requested
+    if "CPU" not in active_cols:
+        active_cols.insert(0, "CPU")
     cmd = ["turbostat", "--interval", str(interval), "--quiet",
-           "--show", ",".join(TURBOSTAT_COLS)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+           "--show", ",".join(active_cols)]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+def run_turbostat(proc):
     block = []
     for line in proc.stdout:
         s = line.strip()
@@ -208,23 +293,95 @@ def run_turbostat(interval):
             block.append(s)
     if block:
         yield "\n".join(block)
-    proc.wait()
 
 def main():
+    global show_menu, menu_cursor
     parser = argparse.ArgumentParser()
     parser.add_argument("--interval", "-i", type=int, default=1)
     args = parser.parse_args()
     check_turbostat()
 
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
     summary, cpu_rows = None, []
+    proc = spawn_turbostat(args.interval)
+    stream = run_turbostat(proc)
+    needs_restart = False
+
     try:
+        tty.setcbreak(fd)
         with Live(build_ui(summary, cpu_rows, args.interval),
                   refresh_per_second=4, screen=True, console=console) as live:
-            for chunk in run_turbostat(args.interval):
-                summary, cpu_rows = parse_block(chunk)
+            while True:
+                # Handle Non-Blocking Keyboard Input
+                while True:
+                    dr, dw, de = select.select([sys.stdin], [], [], 0.0)
+                    if not dr:
+                        break
+                    ch = sys.stdin.read(1)
+                    if not ch:
+                        break
+                    if ch in ('q', 'Q'):
+                        return
+                    elif ch in ('m', 'M'):
+                        show_menu = not show_menu
+                    elif ch == '\x1b':
+                        # Handle escape sequence or plain Esc
+                        dr2, dw2, de2 = select.select([sys.stdin], [], [], 0.0)
+                        if dr2:
+                            seq = sys.stdin.read(1)
+                            if seq == '[':
+                                dr3, dw3, de3 = select.select([sys.stdin], [], [], 0.0)
+                                if dr3:
+                                    key = sys.stdin.read(1)
+                                    if key == 'A': # Up
+                                        menu_cursor = max(0, menu_cursor - 1)
+                                    elif key == 'B': # Down
+                                        menu_cursor = min(len(TURBOSTAT_COLS) - 1, menu_cursor + 1)
+                        else:
+                            show_menu = False
+                    elif ch in (' ', '\n', '\r'):
+                        if show_menu:
+                            col = TURBOSTAT_COLS[menu_cursor]
+                            if col != "CPU":
+                                column_state[col] = not column_state[col]
+                                needs_restart = True
+
+                if needs_restart:
+                    proc.terminate()
+                    proc.wait()
+                    proc = spawn_turbostat(args.interval)
+                    stream = run_turbostat(proc)
+                    needs_restart = False
+
+                # We need to process stream manually with next() to allow polling in while loop
+                # rather than blocking completely on a for loop over stream
+                try:
+                    # check if stream has data using select. If not, don't block
+                    if proc.poll() is not None:
+                        # Process died, maybe try to read remaining
+                        pass
+
+                    # We can use select on proc.stdout to check if there's data to read
+                    dr_proc, _, _ = select.select([proc.stdout], [], [], 0.1)
+                    if dr_proc:
+                        chunk = next(stream)
+                        summary, cpu_rows = parse_block(chunk)
+                        if summary is not None:
+                            busy_history.append(fv(summary, "Busy%"))
+                except StopIteration:
+                    pass
+
                 live.update(build_ui(summary, cpu_rows, args.interval))
+
     except KeyboardInterrupt:
         console.print(f"\n[{C_LABEL}]Hasta luego.[/{C_LABEL}]")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
 
 if __name__ == "__main__":
     main()
