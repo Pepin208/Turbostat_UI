@@ -33,18 +33,28 @@ C_PKG    = "#FFB347"
 C_IDLE   = "#56CFE1"
 C_BORDER = "#2A4A6A"
 
-TURBOSTAT_COLS = [
-    "CPU","Busy%","Bzy_MHz","CPU%c1","CPU%c7",
-    "CoreTmp","CoreThr","PkgTmp","GFX%rc6","GFXMHz",
-    "PkgWatt","GFXWatt","SysWatt"
-]
-
 import collections
 busy_history = collections.deque(maxlen=30)
 
+TURBOSTAT_COLS = []
 show_menu = False
 menu_cursor = 0
-column_state = {col: True for col in TURBOSTAT_COLS}
+column_state = {}
+
+def discover_columns() -> list:
+    try:
+        res = subprocess.run(["turbostat", "-n", "1", "--quiet"], capture_output=True, text=True)
+        lines = res.stdout.strip().splitlines()
+        if lines:
+            header = lines[0].split()
+            if header and "CPU" in header:
+                header.remove("CPU")
+            header.insert(0, "CPU")
+            return header
+    except Exception:
+        pass
+    # Fallback default
+    return ["CPU","Busy%","Bzy_MHz","CPU%c1","CPU%c7","CoreTmp","CoreThr","PkgTmp","PkgWatt","SysWatt"]
 
 def check_turbostat():
     if not shutil.which("turbostat"):
@@ -279,39 +289,65 @@ def spawn_turbostat(interval):
         active_cols.insert(0, "CPU")
     cmd = ["turbostat", "--interval", str(interval), "--quiet",
            "--show", ",".join(active_cols)]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    os.set_blocking(proc.stdout.fileno(), False)
+    return proc
 
 def run_turbostat(proc):
     block = []
-    for line in proc.stdout:
+    while True:
+        try:
+            line = proc.stdout.readline()
+        except BlockingIOError:
+            line = None
+
+        if line is None or line == "":
+            yield None
+            if proc.poll() is not None:
+                # One last attempt to drain
+                try:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                except BlockingIOError:
+                    break
+            continue
+
         s = line.strip()
+        if not s:
+            continue
+
         if s.startswith("CPU"):
             if block:
                 yield "\n".join(block)
             block = [s]
         elif block:
             block.append(s)
+
     if block:
         yield "\n".join(block)
 
 def main():
-    global show_menu, menu_cursor
+    global show_menu, menu_cursor, TURBOSTAT_COLS, column_state
     parser = argparse.ArgumentParser()
     parser.add_argument("--interval", "-i", type=int, default=1)
     args = parser.parse_args()
     check_turbostat()
 
+    TURBOSTAT_COLS = discover_columns()
+    column_state = {col: True for col in TURBOSTAT_COLS}
+
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
-    summary, cpu_rows = None, []
+    current_summary, current_cpu_rows = None, []
     proc = spawn_turbostat(args.interval)
     stream = run_turbostat(proc)
     needs_restart = False
 
     try:
         tty.setcbreak(fd)
-        with Live(build_ui(summary, cpu_rows, args.interval),
+        with Live(build_ui(current_summary, current_cpu_rows, args.interval),
                   refresh_per_second=4, screen=True, console=console) as live:
             while True:
                 # Handle Non-Blocking Keyboard Input
@@ -319,9 +355,13 @@ def main():
                     dr, dw, de = select.select([sys.stdin], [], [], 0.0)
                     if not dr:
                         break
-                    ch = sys.stdin.read(1)
-                    if not ch:
+                    try:
+                        ch_bytes = os.read(sys.stdin.fileno(), 1)
+                    except BlockingIOError:
                         break
+                    if not ch_bytes:
+                        break
+                    ch = ch_bytes.decode('utf-8', errors='ignore')
                     if ch in ('q', 'Q'):
                         return
                     elif ch in ('m', 'M'):
@@ -330,11 +370,17 @@ def main():
                         # Handle escape sequence or plain Esc
                         dr2, dw2, de2 = select.select([sys.stdin], [], [], 0.0)
                         if dr2:
-                            seq = sys.stdin.read(1)
+                            try:
+                                seq = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
+                            except BlockingIOError:
+                                seq = ''
                             if seq == '[':
                                 dr3, dw3, de3 = select.select([sys.stdin], [], [], 0.0)
                                 if dr3:
-                                    key = sys.stdin.read(1)
+                                    try:
+                                        key = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
+                                    except BlockingIOError:
+                                        key = ''
                                     if key == 'A': # Up
                                         menu_cursor = max(0, menu_cursor - 1)
                                     elif key == 'B': # Down
@@ -355,25 +401,18 @@ def main():
                     stream = run_turbostat(proc)
                     needs_restart = False
 
-                # We need to process stream manually with next() to allow polling in while loop
-                # rather than blocking completely on a for loop over stream
                 try:
-                    # check if stream has data using select. If not, don't block
-                    if proc.poll() is not None:
-                        # Process died, maybe try to read remaining
-                        pass
-
-                    # We can use select on proc.stdout to check if there's data to read
-                    dr_proc, _, _ = select.select([proc.stdout], [], [], 0.1)
-                    if dr_proc:
-                        chunk = next(stream)
-                        summary, cpu_rows = parse_block(chunk)
-                        if summary is not None:
-                            busy_history.append(fv(summary, "Busy%"))
+                    chunk = next(stream)
+                    if chunk is not None:
+                        new_summary, new_cpu_rows = parse_block(chunk)
+                        if new_summary is not None:
+                            current_summary, current_cpu_rows = new_summary, new_cpu_rows
+                            busy_history.append(fv(current_summary, "Busy%"))
                 except StopIteration:
                     pass
 
-                live.update(build_ui(summary, cpu_rows, args.interval))
+                live.update(build_ui(current_summary, current_cpu_rows, args.interval))
+                time.sleep(0.05)
 
     except KeyboardInterrupt:
         console.print(f"\n[{C_LABEL}]Hasta luego.[/{C_LABEL}]")
